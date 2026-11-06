@@ -1,0 +1,383 @@
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+
+from backend.models import (
+    FinancialData, RegimeTaxDetails, TaxCalculationResponse, 
+    TaxRegimeComparison, TaxSavingSuggestion, TaxSlabDetail, TaxRegime
+)
+from backend.config import TAX_SLABS, DEDUCTION_LIMITS, is_metro_city
+
+logger = logging.getLogger(__name__)
+
+class TaxCalculatorService:
+    """Service for comprehensive tax calculations"""
+
+    def __init__(self):
+        self.current_year = "2024-25"
+        self.cess_rate = 0.04  # 4% Health and Education Cess
+
+    def calculate_comprehensive_tax(
+        self, 
+        financial_data: FinancialData, 
+        assessment_year: str = "2024-25"
+    ) -> TaxCalculationResponse:
+        """Calculate tax for both regimes and provide comparison"""
+
+        try:
+            # Calculate old regime tax
+            old_regime_details = self._calculate_regime_tax(
+                financial_data, TaxRegime.OLD, assessment_year
+            )
+
+            # Calculate new regime tax
+            new_regime_details = self._calculate_regime_tax(
+                financial_data, TaxRegime.NEW, assessment_year
+            )
+
+            # Determine recommendation
+            if old_regime_details.total_tax <= new_regime_details.total_tax:
+                recommended_regime = TaxRegime.OLD
+                savings_amount = new_regime_details.total_tax - old_regime_details.total_tax
+            else:
+                recommended_regime = TaxRegime.NEW
+                savings_amount = old_regime_details.total_tax - new_regime_details.total_tax
+
+            return TaxCalculationResponse(
+                old_regime=old_regime_details,
+                new_regime=new_regime_details,
+                recommended_regime=recommended_regime,
+                savings_amount=savings_amount
+            )
+
+        except Exception as e:
+            logger.error(f"Error in comprehensive tax calculation: {e}")
+            raise
+
+    def _calculate_regime_tax(
+        self, 
+        financial_data: FinancialData, 
+        regime: TaxRegime,
+        assessment_year: str
+    ) -> RegimeTaxDetails:
+        """Calculate tax for specific regime"""
+
+        # Calculate gross income
+        gross_income = financial_data.total_income
+        logger.info(f"DEBUG: Calculating {regime.value} regime tax")
+        logger.info(f"DEBUG: Gross income: {gross_income}")
+        logger.info(f"DEBUG: Salary breakdown: basic={financial_data.basic_salary}, hra={financial_data.hra}, special={financial_data.special_allowance}")
+        logger.info(f"DEBUG: Other income: interest={financial_data.interest_income}, rental={financial_data.rental_income}, capital_gains={financial_data.capital_gains}")
+
+        # Calculate deductions based on regime
+        if regime == TaxRegime.OLD:
+            total_deductions = self._calculate_old_regime_deductions(financial_data)
+        else:
+            total_deductions = self._calculate_new_regime_deductions(financial_data)
+
+        logger.info(f"DEBUG: Total deductions for {regime.value} regime: {total_deductions}")
+
+        # Calculate taxable income
+        taxable_income = max(0, gross_income - total_deductions)
+        logger.info(f"DEBUG: Taxable income: {taxable_income}")
+
+        # Get tax slabs for the regime
+        tax_slabs = self.get_tax_slabs(regime.value, assessment_year)
+
+        # Calculate tax using slabs
+        tax_calculation = self._calculate_slab_tax(taxable_income, tax_slabs)
+
+        # Calculate cess (4% of income tax)
+        cess = tax_calculation["total_tax"] * self.cess_rate
+        logger.info(f"DEBUG: Tax before cess: {tax_calculation['total_tax']}, Cess (4%): {cess}")
+
+        # Total tax including cess
+        total_tax = tax_calculation["total_tax"] + cess
+
+        # Calculate effective tax rate
+        effective_tax_rate = (total_tax / gross_income * 100) if gross_income > 0 else 0
+        logger.info(f"DEBUG: Total tax: {total_tax}, Effective rate: {effective_tax_rate}%")
+
+        # Calculate refund/payable
+        taxes_paid = financial_data.tds_deducted + financial_data.advance_tax
+        refund_or_payable = total_tax - taxes_paid
+        logger.info(f"DEBUG: TDS: {financial_data.tds_deducted}, Advance tax: {financial_data.advance_tax}, Refund/Payable: {refund_or_payable}")
+
+        return RegimeTaxDetails(
+            regime=regime,
+            gross_income=gross_income,
+            taxable_income=taxable_income,
+            total_deductions=total_deductions,
+            tax_before_cess=tax_calculation["total_tax"],
+            cess=cess,
+            total_tax=total_tax,
+            tax_slabs=tax_calculation["slab_details"],
+            effective_tax_rate=round(effective_tax_rate, 2),
+            tds_deducted=financial_data.tds_deducted,
+            advance_tax=financial_data.advance_tax,
+            refund_or_payable=refund_or_payable
+        )
+
+    def _calculate_hra_exemption(self, financial_data: FinancialData) -> float:
+        """Calculate HRA exemption based on rules:
+        Minimum of:
+        1. Actual HRA received
+        2. 50% of basic salary (metro) or 40% (non-metro)
+        3. Actual rent paid minus 10% of basic salary
+        """
+        if not financial_data.hra or not financial_data.rent_paid:
+            return 0
+
+        # Get city type rate (50% for metro, 40% for non-metro)
+        is_metro = financial_data.city and is_metro_city(financial_data.city)
+        salary_percent = DEDUCTION_LIMITS["hra_metro_rate"] if is_metro else DEDUCTION_LIMITS["hra_non_metro_rate"]
+        
+        # Calculate the three conditions
+        actual_hra = financial_data.hra
+        salary_based = financial_data.basic_salary * salary_percent
+        rent_based = max(0, financial_data.rent_paid - (financial_data.basic_salary * 0.1))
+
+        # Return minimum of the three
+        return min(actual_hra, salary_based, rent_based)
+
+    def _calculate_old_regime_deductions(self, financial_data: FinancialData) -> float:
+        """Calculate total deductions for old regime"""
+
+        deductions = 0
+
+        # Standard deduction
+        deductions += financial_data.standard_deduction
+
+        # HRA exemption
+        deductions += self._calculate_hra_exemption(financial_data)
+
+        # Section 80C (max 1.5 lakh)
+        deductions += min(financial_data.section_80c, DEDUCTION_LIMITS["section_80c"])
+
+        # Section 80D (medical insurance)
+        deductions += min(financial_data.section_80d, DEDUCTION_LIMITS["section_80d"]["individual"])
+
+        # Section 80G (donations)
+        deductions += financial_data.section_80g
+
+        # Section 24 (home loan interest)
+        deductions += financial_data.section_24
+
+        # Section 80CCD(1B) - NPS additional deduction (max 50k)
+        deductions += min(financial_data.section_80ccd1b, DEDUCTION_LIMITS["section_80ccd1b"])
+
+        # Section 80E (education loan interest)
+        deductions += financial_data.section_80e
+
+        # Section 80TTA (interest on savings account)
+        deductions += min(financial_data.section_80tta, DEDUCTION_LIMITS["section_80tta"])
+
+        # Professional tax
+        deductions += financial_data.professional_tax
+
+        return deductions
+
+    def _calculate_new_regime_deductions(self, financial_data: FinancialData) -> float:
+        """Calculate total deductions for new regime (very limited)"""
+
+        deductions = 0
+
+        # Standard deduction (available in new regime)
+        deductions += financial_data.standard_deduction
+
+        # Professional tax
+        deductions += financial_data.professional_tax
+
+        return deductions
+
+    def _calculate_slab_tax(self, taxable_income: float, tax_slabs: List[Dict]) -> Dict:
+        """Calculate tax using progressive slabs"""
+
+        total_tax = 0
+        slab_details = []
+        remaining_income = taxable_income
+
+        # DEBUG: Log input values
+        logger.info(f"DEBUG: _calculate_slab_tax called with taxable_income={taxable_income}")
+        logger.info(f"DEBUG: Tax slabs: {tax_slabs}")
+
+        for slab in tax_slabs:
+            min_amount = slab["min"]
+            max_amount = slab["max"] if slab["max"] else float('inf')
+            rate = slab["rate"]
+
+            if remaining_income <= 0:
+                break
+
+            # Calculate taxable amount in this slab
+            # The slab_range is the width of the bracket
+            if max_amount == float('inf'):
+                slab_range = remaining_income  # All remaining goes to this bracket
+            else:
+                slab_range = max_amount - min_amount
+            
+            slab_taxable = min(remaining_income, slab_range)
+
+            # Calculate tax for this slab
+            slab_tax = slab_taxable * (rate / 100)
+            total_tax += slab_tax
+
+            logger.info(f"DEBUG: Slab {min_amount}-{max_amount}: rate={rate}%, taxable={slab_taxable}, tax={slab_tax}")
+
+            # Add to slab details
+            slab_details.append(TaxSlabDetail(
+                min_amount=min_amount,
+                max_amount=max_amount if max_amount != float('inf') else None,
+                rate=rate,
+                tax_amount=slab_tax
+            ))
+
+            remaining_income -= slab_taxable
+
+            if remaining_income <= 0 or max_amount == float('inf'):
+                break
+
+        logger.info(f"DEBUG: Total tax calculated: {total_tax}")
+
+        return {
+            "total_tax": total_tax,
+            "slab_details": slab_details
+        }
+
+    def get_tax_slabs(self, regime: str, assessment_year: str = "2024-25") -> List[Dict]:
+        """Get tax slabs for specified regime and year"""
+
+        try:
+            return TAX_SLABS[assessment_year][regime]
+        except KeyError:
+            logger.warning(f"Tax slabs not found for {regime} regime in {assessment_year}")
+            # Return current year slabs as fallback
+            return TAX_SLABS["2024-25"][regime]
+
+    def compare_regimes(
+        self, 
+        financial_data: FinancialData, 
+        assessment_year: str = "2024-25"
+    ) -> TaxRegimeComparison:
+        """Compare old vs new tax regime"""
+
+        try:
+            # Calculate comprehensive tax
+            result = self.calculate_comprehensive_tax(financial_data, assessment_year)
+
+            old_tax = result.old_regime.total_tax
+            new_tax = result.new_regime.total_tax
+            difference = abs(old_tax - new_tax)
+
+            # Determine recommendation and reason
+            if old_tax < new_tax:
+                recommended = TaxRegime.OLD
+                reason = f"Old regime saves ₹{difference:,.0f} due to available deductions"
+            elif new_tax < old_tax:
+                recommended = TaxRegime.NEW
+                reason = f"New regime saves ₹{difference:,.0f} due to lower tax rates"
+            else:
+                recommended = TaxRegime.OLD  # Default to old if equal
+                reason = "Both regimes result in similar tax liability"
+
+            # Create detailed breakdown
+            breakdown = {
+                "old_regime": {
+                    "gross_income": result.old_regime.gross_income,
+                    "total_deductions": result.old_regime.total_deductions,
+                    "taxable_income": result.old_regime.taxable_income,
+                    "tax_liability": result.old_regime.total_tax,
+                    "effective_rate": result.old_regime.effective_tax_rate
+                },
+                "new_regime": {
+                    "gross_income": result.new_regime.gross_income,
+                    "total_deductions": result.new_regime.total_deductions,
+                    "taxable_income": result.new_regime.taxable_income,
+                    "tax_liability": result.new_regime.total_tax,
+                    "effective_rate": result.new_regime.effective_tax_rate
+                }
+            }
+
+            return TaxRegimeComparison(
+                old_regime_tax=old_tax,
+                new_regime_tax=new_tax,
+                difference=difference,
+                recommended=recommended,
+                reason=reason,
+                breakdown=breakdown
+            )
+
+        except Exception as e:
+            logger.error(f"Error comparing regimes: {e}")
+            raise
+
+    def get_tax_saving_suggestions(
+        self, 
+        income: float, 
+        current_deductions: Dict[str, float],
+        regime: str = "old"
+    ) -> List[TaxSavingSuggestion]:
+        """Provide personalized tax saving suggestions"""
+
+        suggestions = []
+
+        if regime == "old":
+            # Section 80C suggestions
+            current_80c = current_deductions.get("section_80c", 0)
+            if current_80c < DEDUCTION_LIMITS["section_80c"]:
+                remaining = DEDUCTION_LIMITS["section_80c"] - current_80c
+                tax_saved = remaining * 0.30  # Assuming 30% tax bracket
+
+                suggestions.append(TaxSavingSuggestion(
+                    category="Section 80C Investment",
+                    description=f"Invest ₹{remaining:,.0f} more in 80C instruments (PPF, ELSS, NSC, etc.)",
+                    potential_savings=tax_saved,
+                    implementation_difficulty="Easy",
+                    priority=1,
+                    details="Popular options: PPF (15-year lock-in), ELSS (3-year lock-in), NSC (5-year)"
+                ))
+
+            # Section 80D suggestions
+            current_80d = current_deductions.get("section_80d", 0)
+            if current_80d < DEDUCTION_LIMITS["section_80d"]["individual"]:
+                remaining = DEDUCTION_LIMITS["section_80d"]["individual"] - current_80d
+                tax_saved = remaining * 0.30
+
+                suggestions.append(TaxSavingSuggestion(
+                    category="Health Insurance (80D)",
+                    description=f"Increase health insurance premium by ₹{remaining:,.0f}",
+                    potential_savings=tax_saved,
+                    implementation_difficulty="Easy",
+                    priority=2,
+                    details="Consider family floater plans or top-up insurance for better coverage"
+                ))
+
+            # NPS suggestions
+            current_nps = current_deductions.get("section_80ccd1b", 0)
+            if current_nps < DEDUCTION_LIMITS["section_80ccd1b"]:
+                remaining = DEDUCTION_LIMITS["section_80ccd1b"] - current_nps
+                tax_saved = remaining * 0.30
+
+                suggestions.append(TaxSavingSuggestion(
+                    category="NPS Investment (80CCD1B)",
+                    description=f"Additional NPS contribution of ₹{remaining:,.0f}",
+                    potential_savings=tax_saved,
+                    implementation_difficulty="Medium",
+                    priority=3,
+                    details="Long-term retirement planning with tax benefits. Lock-in till 60 years."
+                ))
+
+        else:  # New regime
+            suggestions.append(TaxSavingSuggestion(
+                category="Regime Comparison",
+                description="Compare with old regime if you have significant deductions",
+                potential_savings=0,
+                implementation_difficulty="Easy",
+                priority=1,
+                details="New regime has lower rates but limited deductions. Compare annually."
+            ))
+
+        # Sort by priority
+        suggestions.sort(key=lambda x: x.priority)
+
+        return suggestions
